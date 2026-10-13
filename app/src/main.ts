@@ -38,26 +38,33 @@ interface Sender { send(fill: (buf: Uint8Array) => Promise<unknown>): Promise<vo
 /**
  * A WebSocket written from a worker thread: send() fills a pooled frame buffer, transfers it to the worker
  * (no copy) and returns once the buffer is on its way, waiting first while `inflight` frames are unacknowledged.
+ * A shared worker, not a dedicated one: Playwright attaches to the page and its dedicated workers with the
+ * Network domain on, and Chrome then mirrors every frame sent from them over the DevTools pipe (base64 JSON,
+ * 8 MB per 1080p frame); it leaves shared workers alone, so the frames only go over the socket.
  */
 function sender(url: string, inflight: number): Promise<Sender> {
   let s = senders.get(url);
   if (s) return s;
   s = new Promise<Sender>((resolve, reject) => {
     const src = `let ws;
-      onmessage = (e) => {
-        const m = e.data;
-        if (m.open) {
-          ws = new WebSocket(m.open); ws.binaryType = 'arraybuffer';
-          ws.onopen = () => postMessage({ open: true });
-          ws.onerror = () => postMessage({ error: 'websocket error' });
-          ws.onclose = () => postMessage({ error: 'websocket closed' });
-          ws.onmessage = (ev) => postMessage({ acked: +ev.data || 0 });
-        } else {
-          ws.send(m.buf); // (copies the frame: the buffer can go straight back)
-          postMessage({ free: m.buf }, [m.buf]);
-        }
+      onconnect = (c) => {
+        const port = c.ports[0];
+        port.onmessage = (e) => {
+          const m = e.data;
+          if (m.open) {
+            ws = new WebSocket(m.open); ws.binaryType = 'arraybuffer';
+            ws.onopen = () => port.postMessage({ open: true });
+            ws.onerror = () => port.postMessage({ error: 'websocket error' });
+            ws.onclose = () => port.postMessage({ error: 'websocket closed' });
+            ws.onmessage = (ev) => port.postMessage({ acked: +ev.data || 0 });
+          } else {
+            ws.send(m.buf); // (copies the frame: the buffer can go straight back)
+            port.postMessage({ free: m.buf }, [m.buf]);
+          }
+        };
       };`;
-    const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    // (a blob URL per sender: its own worker, not shared with another page or socket)
+    const w = new SharedWorker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' }))).port;
     const free: ArrayBuffer[] = [];
     let sent = 0, acked = 0, failed = '', pool = 0;
     let wake: (() => void) | null = null;

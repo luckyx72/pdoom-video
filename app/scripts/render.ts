@@ -68,6 +68,7 @@ async function openPage(url: string) {
   if (sceneErrors.length) console.error('SCENE ERRORS:\n' + sceneErrors.join('\n'));
   return { browser, page, logs };
 }
+type Renderer = Awaited<ReturnType<typeof openPage>>;
 
 async function stills(page: Page, times: number[], outDir: string) {
   mkdirSync(outDir, { recursive: true });
@@ -112,9 +113,9 @@ async function sheet(page: Page, times: number[], cols: number, out: string) {
  * single ffmpeg, so the file is the same as with one worker. A frame is acknowledged once it is written or
  * waiting in a bounded reorder buffer, and each page keeps at most a few frames unacknowledged, so memory stays
  * bounded at 4K. One worker already keeps the GPU busy in the heavy scenes; a second one fills the gaps in the
- * light ones (2D drawing, readback, transfer).
+ * light ones (2D drawing, readback, transfer). `first` (already open) is worker 0.
  */
-async function video(url: string, from: number, to: number, fps: number, out: string) {
+async function video(url: string, first: Renderer, from: number, to: number, fps: number, out: string) {
   mkdirSync(path.dirname(out), { recursive: true });
   const crf = opt('crf', '16')!;
   const audio = path.join(ROOT, 'audio/pdoom.mp3');
@@ -230,7 +231,7 @@ async function video(url: string, from: number, to: number, fps: number, out: st
   });
   // chunks in order from a shared cursor
   const take = () => { if (cursor >= f1) return null; const a = cursor; cursor = Math.min(f1, a + chunk); return [a, cursor] as const; };
-  const pages: Awaited<ReturnType<typeof openPage>>[] = [];
+  const pages: Renderer[] = [first];
   const used: Record<string, number> = {};
   const closePages = async () => {
     for (const p of pages.splice(0)) {
@@ -240,7 +241,7 @@ async function video(url: string, from: number, to: number, fps: number, out: st
   };
   let ok = false;
   try {
-    const opened = await Promise.allSettled(Array.from({ length: workers }, () => openPage(url)));
+    const opened = await Promise.allSettled(Array.from({ length: workers - 1 }, () => openPage(url)));
     for (const o of opened) if (o.status === 'fulfilled') pages.push(o.value);
     for (const o of opened) if (o.status === 'rejected') throw o.reason;
     const rendering = Promise.all(pages.map(async ({ page }, k) => {
@@ -278,10 +279,13 @@ const { url, stop } = await ensureServer();
 if (mode === 'video') {
   try {
     // (the duration comes from the audio analysis, the same in every page)
-    const { browser, page } = await openPage(url);
-    const dur: number = await page.evaluate(() => (window as any).__pdoom.duration);
-    await browser.close();
-    await video(url, +opt('from', '0')!, +opt('to', String(dur))!, +opt('fps', '60')!, path.resolve(opt('out', path.join(ROOT, 'out/pdoom.mp4'))!));
+    // The page that reads it renders too: no browser may be closed before the render ends. Under Bun a closed
+    // browser's pipe sockets are closed again when garbage-collected, and by then their fds are often the next
+    // browser's DevTools pipe (or ffmpeg's stdin), which then dies mid-render ("Target page, context or browser
+    // has been closed").
+    const first = await openPage(url);
+    const dur: number = await first.page.evaluate(() => (window as any).__pdoom.duration);
+    await video(url, first, +opt('from', '0')!, +opt('to', String(dur))!, +opt('fps', '60')!, path.resolve(opt('out', path.join(ROOT, 'out/pdoom.mp4'))!));
   } finally { stop(); }
   process.exit(0);
 }
